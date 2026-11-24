@@ -6,7 +6,7 @@
 [![Java](https://img.shields.io/badge/Java-17-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://openjdk.org/)
 [![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/)
 
-This project demonstrates a production-inspired **CI/CD pipeline** that automates the build, versioning, containerization, and deployment of a Java (Maven) application. The pipeline compiles the application into a JAR file, automatically increments its version, builds and tags a Docker image with the updated version, and publishes the image to Docker Hub. To promote reusability and maintainability, the core build and Docker operations are encapsulated within a **Jenkins Shared Library**.
+This project demonstrates a production-inspired **CI/CD pipeline** that automates the build, versioning, containerization, and deployment of a Java (Maven) application. The pipeline compiles the application into a JAR file, automatically increments its version, builds and tags a Docker image with the updated version, publishes the image to Docker Hub, and deploys it to an AWS EC2 instance over SSH. To promote reusability and maintainability, the core build and Docker operations are encapsulated within a **Jenkins Shared Library**.
 
 During the development of this pipeline, I encountered and resolved several real-world challenges commonly faced in production Jenkins environments, including application version management, GitHub authentication using a Personal Access Token (PAT), and Docker socket permission issues. This README explains the pipeline architecture, its implementation, and the solutions used to address each of these challenges.
 
@@ -28,7 +28,7 @@ During the development of this pipeline, I encountered and resolved several real
 
 ## 📌 Project Overview
 
-This repository contains a Java application whose build, versioning, containerization, and publishing process is fully automated through a **Jenkins declarative pipeline**. The pipeline logic itself doesn't live directly in the `Jenkinsfile` — instead, the reusable steps like building the JAR, building the Docker image, logging in and pushing to Docker Hub are abstracted into a **Jenkins Shared Library**, so the same library can drive the pipeline for other Java/Docker projects with minimal changes.
+This repository contains a Java application whose build, versioning, containerization, and publishing process is fully automated through a **Jenkins declarative pipeline**. The pipeline logic itself doesn't live directly in the `Jenkinsfile` — instead, the reusable steps like building the JAR, building the Docker image, logging in and pushing to Docker Hub, and deploying to EC2 are abstracted into a **Jenkins Shared Library**, so the same library can drive the pipeline for other Java/Docker projects with minimal changes.
 
 Every successful pipeline run:
 
@@ -37,11 +37,12 @@ Every successful pipeline run:
 3. Builds a fresh JAR with Maven
 4. Builds a Docker image tagged with that new version
 5. Pushes the image to Docker Hub
-6. Commits and pushes the version bump back to GitHub — so the *next* build starts from a clean, incremented baseline
+6. Deploys the new image to an AWS EC2 instance over SSH
+7. Commits and pushes the version bump back to GitHub — so the *next* build starts from a clean, incremented baseline
 
 <img width="1366" height="768" alt="Screenshot (29)" src="https://github.com/user-attachments/assets/f093654e-d500-4a3c-9b6e-3bc2437fab2f" />
 
-> **Note:** The `deploy` stage is currently implemented as a placeholder (`script.groovy`). The next phase of this project is to automate deployment to **AWS**, where the Docker image will be pulled from Docker Hub and deployed to the target environment.
+> **Deployment:** The `deploy` stage calls the shared library's `deploy()` step. Jenkins connects to the EC2 instance over SSH using a private key stored in Jenkins Credentials (`ec2-server-key`, loaded with the SSH Agent plugin), pulls the new image from Docker Hub, stops and removes the old `java-app` container, and starts the new version on port `8081` (container port `8080`).
 
 ---
 
@@ -55,7 +56,7 @@ flowchart TD
     D --> E[Stage: Build Docker Image]
     E --> F[Stage: Docker Login via Jenkins Credentials]
     F --> G[Stage: Push Image to Docker Hub]
-    G --> H[Stage: Deploy - placeholder]
+    G --> H[Stage: Deploy to AWS EC2 over SSH]
     H --> I[Stage: Commit & Push Version Bump]
     I --> J[GitHub repo updated with new version]
     J -.next build starts here.-> C
@@ -65,12 +66,14 @@ flowchart TD
         L2[buildImage]
         L3[dockerLogin]
         L4[dockerPush]
+        L5[deploy]
     end
 
     D -.calls.-> L1
     E -.calls.-> L2
     F -.calls.-> L3
     G -.calls.-> L4
+    H -.calls.-> L5
 ```
 
 ```mermaid
@@ -79,6 +82,7 @@ sequenceDiagram
     participant JK as Jenkins
     participant LIB as Shared Library
     participant DH as Docker Hub
+    participant EC2 as AWS EC2
 
     GH->>JK: Webhook / manual trigger
     JK->>JK: mvn versions:set (increment version)
@@ -90,6 +94,10 @@ sequenceDiagram
     LIB->>DH: Authenticate (Jenkins Credentials)
     JK->>LIB: dockerPush(image:tag)
     LIB->>DH: Push image
+    JK->>LIB: deploy(host, key, image:tag, ...)
+    LIB->>EC2: SSH (ec2-server-key)
+    EC2->>DH: docker pull image:tag
+    EC2->>EC2: Replace old container, run new version
     JK->>GH: git commit + push (PAT auth) - version bump
 ```
 
@@ -97,7 +105,8 @@ sequenceDiagram
 
 ## ✨ Features
 
-- ✅ Fully automated Maven build → Docker image → Docker Hub publish pipeline
+- ✅ Fully automated Maven build → Docker image → Docker Hub publish → AWS EC2 deploy pipeline
+- ✅ SSH-based deployment that replaces the running container with the new version on every build
 - ✅ Automatic semantic version incrementing on every build
 - ✅ Dynamic, non-hardcoded Docker image tagging tied to the app version
 - ✅ Reusable **Jenkins Shared Library** for Maven and Docker logic
@@ -118,6 +127,7 @@ sequenceDiagram
 | Reusable Automation  | Jenkins Shared Library (Groovy)       |
 | Containerization     | Docker                                |
 | Image Registry       | Docker Hub                            |
+| Deployment Target    | AWS EC2 (SSH via Jenkins SSH Agent)   |
 | Version Control      | Git & GitHub                          |
 | Secrets Management   | Jenkins Credentials Store             |
 | Authentication       | GitHub Personal Access Token (PAT)    |
@@ -132,7 +142,7 @@ sequenceDiagram
 | 1 | **Increment Version**      | Maven's `build-helper` and `versions` plugins bump the patch version in `pom.xml`, and the new version is read into `env.IMAGE_NAME`. |
 | 2 | **Build JAR**               | The shared library's `buildJar()` function executes `mvn clean package` to generate the deployable JAR file. The `clean` phase removes artifacts from previous builds ensuring that each pipeline execution starts with a fresh workspace and produces a new JAR without reusing outdated build files. |
 | 3 | **Build & Push Image**      | Shared library builds a Docker image tagged with the new version, logs in to Docker Hub using Jenkins Credentials, and pushes the image. |
-| 4 | **Deploy**                  | Placeholder stage (`script.groovy`) — reserved for a future deployment automation project. |
+| 4 | **Deploy**                  | The shared library's `deploy()` step connects to the EC2 instance over SSH with the `ec2-server-key` credential, pulls the new image from Docker Hub, stops and removes the old `java-app` container, and starts the new one on port `8081` (container port `8080`). |
 | 5 | **Commit Version Update**   | The updated `pom.xml` is committed and pushed back to GitHub using a PAT, so the next pipeline run starts from the latest version. |
 
 ---
@@ -143,8 +153,8 @@ To avoid duplicating Maven and Docker commands across multiple pipelines, I extr
 
 The shared library follows the standard Jenkins Shared Library structure:
 
-- **`src/com/example/Docker.groovy`** — a Groovy class holding the actual implementation (`buildDockerImage`, `dockerLogin`, `dockerPush`), implementing `Serializable` so it works safely inside a pipeline's CPS execution model.
-- **`vars/*.groovy`** – Contains lightweight wrapper scripts such as `buildImage.groovy`, `dockerLogin.groovy`, and `dockerPush.groovy`. These wrappers expose the methods defined in the `Docker` class as simple, reusable pipeline steps, allowing them to be invoked directly from the `Jenkinsfile`
+- **`src/com/example/Docker.groovy`** — a Groovy class holding the actual implementation (`buildDockerImage`, `dockerLogin`, `dockerPush`, `deploy`), implementing `Serializable` so it works safely inside a pipeline's CPS execution model.
+- **`vars/*.groovy`** – Contains lightweight wrapper scripts such as `buildJar.groovy`, `buildImage.groovy`, `dockerLogin.groovy`, `dockerPush.groovy`, and `deploy.groovy`. These wrappers expose the methods defined in the `Docker` class as simple, reusable pipeline steps, allowing them to be invoked directly from the `Jenkinsfile`
 
 Example — `vars/dockerPush.groovy`:
 
@@ -283,6 +293,7 @@ This fixed the issue because it gave the `jenkins` user read/write access to the
 | **Automation Design** | Jenkins Shared Libraries, Version Automation, Image Tagging |
 | **Build Tools** | Maven |
 | **Containerization** | Docker, Docker Hub, Dockerfile design |
+| **Cloud Deployment** | AWS EC2, SSH-based deployment, Jenkins SSH Agent |
 | **Source Control** | Git, GitHub, GitHub Personal Access Tokens |
 | **Security** | Jenkins Credentials, Docker Socket Management |
 | **Troubleshooting** | Diagnosing and resolving real pipeline failures (permissions, auth, versioning) |
